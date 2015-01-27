@@ -521,7 +521,7 @@ static int send_file(THD *thd)
 
 int test_for_non_eof_log_read_errors(int error, const char **errmsg)
 {
-  if (error == LOG_READ_EOF)
+  if (error == LOG_READ_EOF || error == LOG_READ_BINLOG_LAST_VALID_POS)
     return 0;
   my_errno= ER_MASTER_FATAL_ERROR_READING_BINLOG;
   switch (error) {
@@ -867,7 +867,6 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
   const char *errmsg = "Unknown error";
   char error_text[MAX_SLAVE_ERRMSG]; // to be send to slave via my_message()
   NET* net = &thd->net;
-  mysql_mutex_t *log_lock;
   mysql_cond_t *log_cond;
   uint8 current_checksum_alg= BINLOG_CHECKSUM_ALG_UNDEF;
   Format_description_log_event fdle(BINLOG_VERSION), *p_fdle= &fdle;
@@ -1123,13 +1122,8 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
   */
   thd->variables.max_allowed_packet= MAX_MAX_ALLOWED_PACKET;
 
-  /*
-    We can set log_lock now, it does not move (it's a member of
-    mysql_bin_log, and it's already inited, and it will be destroyed
-    only at shutdown).
-  */
+
   p_coord->pos= pos; // the first hb matches the slave's last seen value
-  log_lock= mysql_bin_log.get_log_lock();
   log_cond= mysql_bin_log.get_log_cond();
   if (pos > BIN_LOG_HEADER_SIZE)
   {
@@ -1143,7 +1137,8 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
        Try to find a Format_description_log_event at the beginning of
        the binlog
      */
-    if (!(error = Log_event::read_log_event(&log, packet, log_lock, 0)))
+    if (!(error = Log_event::read_log_event(&log, packet, 0,
+                                            log_file_name)))
     { 
       DBUG_PRINT("info", ("read_log_event returned 0 on line %d", __LINE__));
       /*
@@ -1236,15 +1231,9 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
     if (reset_transmit_packet(thd, flags, &ev_offset, &errmsg,
                               observe_transmission))
       GOTO_ERR;
-    DBUG_EXECUTE_IF("semi_sync_3-way_deadlock",
-                    {
-                      const char act[]= "now wait_for signal.rotate_finished no_clear_event";
-                      DBUG_ASSERT(!debug_sync_set_action(current_thd,
-                                                         STRING_WITH_LEN(act)));
-                    };);
     bool is_active_binlog= false;
-    while (!thd->killed &&
-           !(error= Log_event::read_log_event(&log, packet, log_lock,
+    while (!thd->killed && 
+           !(error= Log_event::read_log_event(&log, packet,
                                               current_checksum_alg,
                                               log_file_name,
                                               &is_active_binlog)))
@@ -1551,8 +1540,15 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
 
     if (!is_active_binlog)
       goto_next_binlog= true;
-
-    if (!goto_next_binlog)
+    
+    /*
+     When read_log_event in the above loop returns LOG_READ_BINLOG_LAST_
+     VALID_POS instead of normal EOF, we cannot open next binlog file which
+     may result in skipping of the events in current file. Instead check for
+     error value and try to read an event inside this if statement.
+     LOG_READ_EOF confirms that we reached the end of current file.
+    */
+    if (error != LOG_READ_EOF && !goto_next_binlog)
     {
       /*
         Block until there is more data in the log
@@ -1598,23 +1594,56 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
           binary log.  We can avoid the following read if the counter
           has not been updated since last read.
 	*/
-
-        mysql_mutex_lock(log_lock);
-        switch (error= Log_event::read_log_event(&log, packet, (mysql_mutex_t*) 0,
-                                                 current_checksum_alg)) {
+  switch (error= Log_event::read_log_event(&log, packet,
+                                           current_checksum_alg,
+                                           log_file_name)) {
 	case 0:
           DBUG_PRINT("info", ("read_log_event returned 0 on line %d",
                               __LINE__));
 	  /* we read successfully, so we'll need to send it to the slave */
-          mysql_mutex_unlock(log_lock);
 	  read_packet = 1;
           p_coord->pos= uint4korr(packet->ptr() + ev_offset + LOG_POS_OFFSET);
           event_type= (Log_event_type)((*packet)[LOG_EVENT_OFFSET+ev_offset]);
           DBUG_ASSERT(event_type != FORMAT_DESCRIPTION_EVENT);
 	  break;
+    case LOG_READ_EOF:
+        goto_next_binlog = true;
+        break;
 
-	case LOG_READ_EOF:
-        {
+    case LOG_READ_BINLOG_LAST_VALID_POS:
+          {
+          
+          /*
+            Take lock_binlog_pos to ensure that we read everything in
+            binlog file. If there is nothing left to read in binlog file,
+            wait until we get a signal from other threads that binlog is
+            updated.
+          */
+          mysql_bin_log.lock_binlog_end_pos();
+          /*
+            No need to wait if the the current log is not active or
+            we haven't reached binlog_end_pos.
+            Note that is_active may be false positive, but binlog_end_pos
+            is valid here. If rotate thread is about to rotate the log,
+            we will get a singal_update() in open_binlog() which will eventually
+            unblock us and checking is_active() later in read_log_event() will
+            give the valid value.
+          */
+          
+          
+          if (!mysql_bin_log.is_active(log_file_name) ||
+              my_b_tell(&log) < mysql_bin_log.get_binlog_end_pos())
+          {
+            mysql_bin_log.unlock_binlog_end_pos();
+            break;
+          }
+
+          if (thd->server_id==0) // for mysqlbinlog (mysqlbinlog.server_id==0)
+          {
+            mysql_bin_log.unlock_binlog_end_pos();
+            goto end;
+          }
+          
           int ret;
           ulong signal_cnt;
 	  DBUG_PRINT("wait",("waiting for data in binary log"));
@@ -1651,26 +1680,6 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
             --stop-never cannot cause any running dump threads to be
             killed.
           */
-          if (thd->server_id == 0 || ((flags & BINLOG_DUMP_NON_BLOCK) != 0))
-	  {
-            DBUG_PRINT("info", ("stopping dump thread because server_id==0 or the BINLOG_DUMP_NON_BLOCK flag is set: server_id=%u flags=%d", thd->server_id, flags));
-            mysql_mutex_unlock(log_lock);
-            DBUG_EXECUTE_IF("inject_hb_event_on_mysqlbinlog_dump_thread",
-            {
-              /*
-                Send one HB event (with anything in it, content is irrelevant).
-                We just want to check that mysqlbinlog will be able to ignore it.
-
-                Suicide on failure, since if it happens the entire purpose of the
-                test is comprimised.
-               */
-              if (reset_transmit_packet(thd, flags, &ev_offset, &errmsg,
-                                        observe_transmission) ||
-                  send_heartbeat_event(net, packet, p_coord, current_checksum_alg))
-                DBUG_SUICIDE();
-            });
-	    goto end;
-	  }
 
 #ifndef DBUG_OFF
           ulong hb_info_counter= 0;
@@ -1685,7 +1694,8 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
               DBUG_ASSERT(heartbeat_ts);
               set_timespec_nsec(*heartbeat_ts, heartbeat_period);
             }
-            thd->ENTER_COND(log_cond, log_lock,
+            thd->ENTER_COND(log_cond, 
+                            mysql_bin_log.get_binlog_end_pos_lock(),
                             &stage_master_has_sent_all_binlog_to_slave,
                             &old_stage);
             /*
@@ -1752,7 +1762,6 @@ void mysql_binlog_send(THD* thd, char* log_ident, my_off_t pos,
         break;
             
         default:
-          mysql_mutex_unlock(log_lock);
           test_for_non_eof_log_read_errors(error, &errmsg);
           GOTO_ERR;
         }

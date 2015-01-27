@@ -20,8 +20,6 @@
 #include "log_event.h"
 #include "log.h"
 
-extern ulong rpl_read_size;
-
 class Relay_log_info;
 class Master_info;
 
@@ -105,7 +103,6 @@ public:
   enum StageID {
     FLUSH_STAGE,
     SYNC_STAGE,
-    SEMISYNC_STAGE,
     COMMIT_STAGE,
     STAGE_COUNTER
   };
@@ -114,7 +111,6 @@ public:
 #ifdef HAVE_PSI_INTERFACE
             PSI_mutex_key key_LOCK_flush_queue,
             PSI_mutex_key key_LOCK_sync_queue,
-            PSI_mutex_key key_LOCK_semisync_queue,
             PSI_mutex_key key_LOCK_commit_queue,
             PSI_mutex_key key_LOCK_done,
             PSI_cond_key key_COND_done
@@ -135,11 +131,6 @@ public:
     m_queue[SYNC_STAGE].init(
 #ifdef HAVE_PSI_INTERFACE
                              key_LOCK_sync_queue
-#endif
-                             );
-    m_queue[SEMISYNC_STAGE].init(
-#ifdef HAVE_PSI_INTERFACE
-                             key_LOCK_semisync_queue
 #endif
                              );
     m_queue[COMMIT_STAGE].init(
@@ -251,20 +242,15 @@ class MYSQL_BIN_LOG: public TC_LOG, private MYSQL_LOG
   PSI_mutex_key m_key_COND_done;
 
   PSI_mutex_key m_key_LOCK_commit_queue;
-  PSI_mutex_key m_key_LOCK_semisync_queue;
   PSI_mutex_key m_key_LOCK_done;
   PSI_mutex_key m_key_LOCK_flush_queue;
   PSI_mutex_key m_key_LOCK_sync_queue;
   /** The instrumentation key to use for @ LOCK_commit. */
   PSI_mutex_key m_key_LOCK_commit;
-  /** The instrumentation key to use for @ LOCK_semisync. */
-  PSI_mutex_key m_key_LOCK_semisync;
   /** The instrumentation key to use for @ LOCK_sync. */
   PSI_mutex_key m_key_LOCK_sync;
   /** The instrumentation key to use for @ LOCK_xids. */
   PSI_mutex_key m_key_LOCK_xids;
-  /** The instrumentation key to use for @ LOCK_binlog. */
-  PSI_mutex_key m_key_LOCK_binlog_end_pos;
   /** The instrumentation key to use for @ update_cond. */
   PSI_cond_key m_key_update_cond;
   /** The instrumentation key to use for @ prep_xids_cond. */
@@ -277,10 +263,8 @@ class MYSQL_BIN_LOG: public TC_LOG, private MYSQL_LOG
   /* POSIX thread objects are inited by init_pthread_objects() */
   mysql_mutex_t LOCK_index;
   mysql_mutex_t LOCK_commit;
-  mysql_mutex_t LOCK_semisync;
   mysql_mutex_t LOCK_sync;
   mysql_mutex_t LOCK_xids;
-  mysql_mutex_t LOCK_binlog_end_pos;
   mysql_cond_t update_cond;
   ulonglong bytes_written;
   IO_CACHE index_file;
@@ -326,7 +310,6 @@ class MYSQL_BIN_LOG: public TC_LOG, private MYSQL_LOG
   my_atomic_rwlock_t m_prep_xids_lock;
   mysql_cond_t m_prep_xids_cond;
   volatile int32 m_prep_xids;
-  volatile my_off_t binlog_end_pos;
 
   /**
     Increment the prepared XID counter.
@@ -446,15 +429,12 @@ public:
   void set_psi_keys(PSI_mutex_key key_LOCK_index,
                     PSI_mutex_key key_LOCK_commit,
                     PSI_mutex_key key_LOCK_commit_queue,
-                    PSI_mutex_key key_LOCK_semisync,
-                    PSI_mutex_key key_LOCK_semisync_queue,
                     PSI_mutex_key key_LOCK_done,
                     PSI_mutex_key key_LOCK_flush_queue,
                     PSI_mutex_key key_LOCK_log,
                     PSI_mutex_key key_LOCK_sync,
                     PSI_mutex_key key_LOCK_sync_queue,
                     PSI_mutex_key key_LOCK_xids,
-                    PSI_mutex_key key_LOCK_binlog_end_pos,
                     PSI_cond_key key_COND_done,
                     PSI_cond_key key_update_cond,
                     PSI_cond_key key_prep_xids_cond,
@@ -464,7 +444,6 @@ public:
     m_key_COND_done= key_COND_done;
 
     m_key_LOCK_commit_queue= key_LOCK_commit_queue;
-    m_key_LOCK_semisync_queue = key_LOCK_semisync_queue;
     m_key_LOCK_done= key_LOCK_done;
     m_key_LOCK_flush_queue= key_LOCK_flush_queue;
     m_key_LOCK_sync_queue= key_LOCK_sync_queue;
@@ -472,10 +451,8 @@ public:
     m_key_LOCK_index= key_LOCK_index;
     m_key_LOCK_log= key_LOCK_log;
     m_key_LOCK_commit= key_LOCK_commit;
-    m_key_LOCK_semisync = key_LOCK_semisync;
     m_key_LOCK_sync= key_LOCK_sync;
     m_key_LOCK_xids= key_LOCK_xids;
-    m_key_LOCK_binlog_end_pos = key_LOCK_binlog_end_pos;
     m_key_update_cond= key_update_cond;
     m_key_prep_xids_cond= key_prep_xids_cond;
     m_key_file_log= key_file_log;
@@ -536,8 +513,8 @@ private:
   int flush_cache_to_file(my_off_t *flush_end_pos);
   int finish_commit(THD *thd);
   std::pair<bool, bool> sync_binlog_file(bool force);
-  void process_semisync_stage_queue(THD *queue_head);
   void process_commit_stage_queue(THD *thd, THD *queue);
+  void process_after_commit_stage_queue(THD *thd, THD *first);
   int process_flush_stage_queue(my_off_t *total_bytes_var, bool *rotate_var,
                                 THD **out_queue_var);
   int ordered_commit(THD *thd, bool all, bool skip_commit = false);
@@ -579,7 +556,6 @@ public:
   }
   void set_max_size(ulong max_size_arg);
   void signal_update();
-  void update_binlog_end_pos();
   int wait_for_update_relay_log(THD* thd, const struct timespec * timeout);
   int  wait_for_update_bin_log(THD* thd, const struct timespec * timeout);
 public:
@@ -643,7 +619,7 @@ public:
   int remove_logs_from_index(LOG_INFO* linfo, bool need_update_threads);
   int rotate(bool force_rotate, bool* check_purge);
   void purge();
-  int rotate_and_purge(THD* thd, bool force_rotate);
+  int rotate_and_purge(bool force_rotate);
   /**
      Flush binlog cache and synchronize to disk.
 
@@ -701,26 +677,6 @@ public:
   inline void unlock_index() { mysql_mutex_unlock(&LOCK_index);}
   inline IO_CACHE *get_index_file() { return &index_file;}
   inline uint32 get_open_count() { return open_count; }
-  /*
-    It is called by the threads(e.g. dump thread) which want to read
-    hot log without LOCK_log protection.
-  */
-  my_off_t get_binlog_end_pos()
-  {
-    mysql_mutex_assert_not_owner(&LOCK_log);
-    mysql_mutex_assert_owner(&LOCK_binlog_end_pos);
-    return binlog_end_pos;
-  }
-
-  my_off_t get_binlog_end_pos_without_lock()
-  {
-    mysql_mutex_assert_not_owner(&LOCK_log);
-    mysql_mutex_assert_not_owner(&LOCK_binlog_end_pos);
-    return binlog_end_pos;
-  }
-  mysql_mutex_t* get_binlog_end_pos_lock() { return &LOCK_binlog_end_pos; }
-  void lock_binlog_end_pos() { mysql_mutex_lock(&LOCK_binlog_end_pos); }
-  void unlock_binlog_end_pos() { mysql_mutex_unlock(&LOCK_binlog_end_pos); }
 };
 
 typedef struct st_load_file_info
@@ -760,7 +716,6 @@ int gtid_empty_group_log_and_cleanup(THD *thd);
 extern const char *log_bin_index;
 extern const char *log_bin_basename;
 extern bool opt_binlog_order_commits;
-extern bool opt_gtid_precommit;
 
 /**
   Turns a relative log binary log path into a full path, based on the
