@@ -38,9 +38,6 @@ using std::min;
 using std::string;
 using std::list;
 
-/* Size for IO_CACHE buffer for binlog & relay log */
-ulong rpl_read_size;
-
 #define FLAGSTR(V,F) ((V)&(F)?#F" ":"")
 
 /**
@@ -65,7 +62,6 @@ static int limit_unsafe_warning_count= 0;
 
 static handlerton *binlog_hton;
 bool opt_binlog_order_commits= true;
-bool opt_gtid_precommit= false;
 
 const char *log_bin_index= 0;
 const char *log_bin_basename= 0;
@@ -1945,7 +1941,7 @@ File open_binlog_file(IO_CACHE *log, const char *log_file_name, const char **err
     *errmsg = "Could not open log file";
     goto err;
   }
-  if (init_io_cache(log, file, rpl_read_size, READ_CACHE, 0, 0,
+  if (init_io_cache(log, file, IO_SIZE*2, READ_CACHE, 0, 0,
                     MYF(MY_WME|MY_DONT_CHECK_FILESIZE)))
   {
     sql_print_error("Failed to create a cache on log (file '%s')",
@@ -2435,7 +2431,6 @@ MYSQL_BIN_LOG::MYSQL_BIN_LOG(uint *sync_period)
   :bytes_written(0), file_id(1), open_count(1),
    sync_period_ptr(sync_period), sync_counter(0),
    m_prep_xids(0),
-   binlog_end_pos(0),
    is_relay_log(0), signal_cnt(0),
    checksum_alg_reset(BINLOG_CHECKSUM_ALG_UNDEF),
    relay_log_checksum_alg(BINLOG_CHECKSUM_ALG_UNDEF),
@@ -2466,10 +2461,8 @@ void MYSQL_BIN_LOG::cleanup()
     mysql_mutex_destroy(&LOCK_log);
     mysql_mutex_destroy(&LOCK_index);
     mysql_mutex_destroy(&LOCK_commit);
-    mysql_mutex_destroy(&LOCK_semisync);
     mysql_mutex_destroy(&LOCK_sync);
     mysql_mutex_destroy(&LOCK_xids);
-    mysql_mutex_destroy(&LOCK_binlog_end_pos);
     mysql_cond_destroy(&update_cond);
     my_atomic_rwlock_destroy(&m_prep_xids_lock);
     mysql_cond_destroy(&m_prep_xids_cond);
@@ -2484,11 +2477,8 @@ void MYSQL_BIN_LOG::init_pthread_objects()
   MYSQL_LOG::init_pthread_objects();
   mysql_mutex_init(m_key_LOCK_index, &LOCK_index, MY_MUTEX_INIT_SLOW);
   mysql_mutex_init(m_key_LOCK_commit, &LOCK_commit, MY_MUTEX_INIT_FAST);
-  mysql_mutex_init(m_key_LOCK_semisync, &LOCK_semisync, MY_MUTEX_INIT_FAST);
   mysql_mutex_init(m_key_LOCK_sync, &LOCK_sync, MY_MUTEX_INIT_FAST);
   mysql_mutex_init(m_key_LOCK_xids, &LOCK_xids, MY_MUTEX_INIT_FAST);
-  mysql_mutex_init(m_key_LOCK_binlog_end_pos, &LOCK_binlog_end_pos,
-                   MY_MUTEX_INIT_FAST);
   mysql_cond_init(m_key_update_cond, &update_cond, 0);
   my_atomic_rwlock_init(&m_prep_xids_lock);
   mysql_cond_init(m_key_prep_xids_cond, &m_prep_xids_cond, NULL);
@@ -2496,7 +2486,6 @@ void MYSQL_BIN_LOG::init_pthread_objects()
 #ifdef HAVE_PSI_INTERFACE
                    m_key_LOCK_flush_queue,
                    m_key_LOCK_sync_queue,
-                   m_key_LOCK_semisync_queue,
                    m_key_LOCK_commit_queue,
                    m_key_LOCK_done, m_key_COND_done
 #endif
@@ -3048,13 +3037,13 @@ bool MYSQL_BIN_LOG::init_gtid_sets(Gtid_set *all_gtids, Gtid_set *lost_gtids,
         case NO_GTIDS:
         {
           /*
-            If the binlog_gtid_simple_recovery is enabled, and the
+            If the simplified_binlog_gtid_recovery is enabled, and the
             last binary log does not contain any GTID event, do not
             read any more binary logs, GLOBAL.GTID_EXECUTED and
             GLOBAL.GTID_PURGED should be empty in the case. Otherwise,
             initialize GTID_EXECUTED as usual.
           */
-          if (binlog_gtid_simple_recovery && !is_relay_log)
+          if (simplified_binlog_gtid_recovery && !is_relay_log)
           {
             DBUG_ASSERT(all_gtids->is_empty() && lost_gtids->is_empty());
             goto end;
@@ -3091,12 +3080,12 @@ bool MYSQL_BIN_LOG::init_gtid_sets(Gtid_set *all_gtids, Gtid_set *lost_gtids,
         case NO_GTIDS:
         {
           /*
-            If the binlog_gtid_simple_recovery is enabled, and the
+            If the simplified_binlog_gtid_recovery is enabled, and the
             first binary log does not contain any GTID event, do not
             read any more binary logs, GLOBAL.GTID_PURGED should be
             empty in the case.
           */
-          if (binlog_gtid_simple_recovery && !is_relay_log)
+          if (simplified_binlog_gtid_recovery && !is_relay_log)
           {
             DBUG_ASSERT(lost_gtids->is_empty());
             goto end;
@@ -3273,8 +3262,6 @@ bool MYSQL_BIN_LOG::open_binlog(const char *log_name,
     else
       global_sid_lock->assert_some_wrlock();
     Previous_gtids_log_event prev_gtids_ev(previous_gtid_set);
-    if (is_relay_log)
-      prev_gtids_ev.set_relay_log_event();
     if (need_sid_lock)
       global_sid_lock->unlock();
     prev_gtids_ev.checksum_alg= s.checksum_alg;
@@ -3316,8 +3303,6 @@ bool MYSQL_BIN_LOG::open_binlog(const char *log_name,
   if (flush_io_cache(&log_file) ||
       mysql_file_sync(log_file.file, MYF(MY_WME)))
     goto err;
-
-  update_binlog_end_pos();
   
   if (write_file_name_to_index_file)
   {
@@ -4879,6 +4864,8 @@ int MYSQL_BIN_LOG::new_file_impl(bool need_lock_log, Format_description_log_even
     mysql_mutex_lock(&LOCK_log);
   else
     mysql_mutex_assert_owner(&LOCK_log);
+  DBUG_EXECUTE_IF("semi_sync_3-way_deadlock",
+                  DEBUG_SYNC(current_thd, "before_rotate_binlog"););
   mysql_mutex_lock(&LOCK_xids);
   /*
     We need to ensure that the number of prepared XIDs are 0.
@@ -4940,22 +4927,12 @@ int MYSQL_BIN_LOG::new_file_impl(bool need_lock_log, Format_description_log_even
     }
     bytes_written += r.data_written;
   }
-
-  // Need flush before updating binlog_end_pos, otherwise dump thread
-  // may give errors.
-  if (flush_io_cache(&log_file))
-  {
-    error = 1;
-    close_on_error = TRUE;
-    goto end;
-  }
-
   /*
     Update needs to be signalled even if there is no rotate event
     log rotation should give the waiting thread a signal to
     discover EOF and move on to the next log.
   */
-  update_binlog_end_pos();
+  signal_update();
 
   old_name=name;
   name=0;				// Don't free name
@@ -5094,7 +5071,7 @@ bool MYSQL_BIN_LOG::after_append_to_relay_log(Master_info *mi)
     }
   }
 
-  update_binlog_end_pos();
+  signal_update();
 
   DBUG_RETURN(error);
 }
@@ -5507,18 +5484,11 @@ void MYSQL_BIN_LOG::purge()
   @retval
     nonzero - error in rotating routine.
 */
-int MYSQL_BIN_LOG::rotate_and_purge(THD* thd, bool force_rotate)
+int MYSQL_BIN_LOG::rotate_and_purge(bool force_rotate)
 {
   int error= 0;
   DBUG_ENTER("MYSQL_BIN_LOG::rotate_and_purge");
   bool check_purge= false;
-
-  /*
-    Wait for handlerton to insert any pending information into the binlog.
-    For e.g. ha_ndbcluster which updates the binlog asynchronously this is
-    needed so that the user see its own commands in the binlog.
-  */
-  ha_binlog_wait(thd);
 
   DBUG_ASSERT(!is_relay_log);
   mysql_mutex_lock(&LOCK_log);
@@ -5858,7 +5828,7 @@ bool MYSQL_BIN_LOG::write_incident(Incident_log_event *ev, bool need_lock_log,
     if (!error && !(error= flush_and_sync()))
     {
       bool check_purge= false;
-      update_binlog_end_pos();
+      signal_update();
       error= rotate(true, &check_purge);
       if (!error && check_purge)
         purge();
@@ -5970,16 +5940,13 @@ bool MYSQL_BIN_LOG::write_cache(THD *thd, binlog_cache_data *cache_data)
         goto err;
       }
 
-      if (!thd->gtid_precommit)
+      global_sid_lock->rdlock();
+      if (gtid_state->update_on_flush(thd) != RETURN_STATUS_OK)
       {
-        global_sid_lock->rdlock();
-        if (gtid_state->update_on_flush(thd) != RETURN_STATUS_OK)
-        {
-          global_sid_lock->unlock();
-          goto err;
-        }
         global_sid_lock->unlock();
+        goto err;
       }
+      global_sid_lock->unlock();
     }
     update_thd_next_event_pos(thd);
   }
@@ -5996,13 +5963,6 @@ err:
   }
   thd->commit_error= THD::CE_FLUSH_ERROR;
 
-  /* Remove gtid from logged_gtid set if error happened. */
-  if (write_error && thd->gtid_precommit)
-  {
-    global_sid_lock->rdlock();
-    gtid_state->remove_gtid_on_failure(thd);
-    global_sid_lock->unlock();
-  }
   DBUG_RETURN(1);
 }
 
@@ -6052,9 +6012,9 @@ int MYSQL_BIN_LOG::wait_for_update_relay_log(THD* thd, const struct timespec *ti
   @retval    0          if got signalled on update
   @retval    non-0      if wait timeout elapsed
   @note
-    LOCK_binlog_end_pos must be taken before calling this function.
-    LOCK_binlog_end_pos is being released while the thread is waiting.
-    LOCK_binlog_end_pos is released by the caller.
+    LOCK_log must be taken before calling this function.
+    LOCK_log is being released while the thread is waiting.
+    LOCK_log is released by the caller.
 */
 
 int MYSQL_BIN_LOG::wait_for_update_bin_log(THD* thd,
@@ -6064,9 +6024,9 @@ int MYSQL_BIN_LOG::wait_for_update_bin_log(THD* thd,
   DBUG_ENTER("wait_for_update_bin_log");
 
   if (!timeout)
-    mysql_cond_wait(&update_cond, &LOCK_binlog_end_pos);
+    mysql_cond_wait(&update_cond, &LOCK_log);
   else
-    ret= mysql_cond_timedwait(&update_cond, &LOCK_binlog_end_pos,
+    ret= mysql_cond_timedwait(&update_cond, &LOCK_log,
                               const_cast<struct timespec *>(timeout));
   DBUG_RETURN(ret);
 }
@@ -6103,7 +6063,7 @@ void MYSQL_BIN_LOG::close(uint exiting)
                   relay_log_checksum_alg != BINLOG_CHECKSUM_ALG_UNDEF);
       s.write(&log_file);
       bytes_written+= s.data_written;
-      update_binlog_end_pos();
+      signal_update();
     }
 #endif /* HAVE_REPLICATION */
 
@@ -6174,26 +6134,6 @@ void MYSQL_BIN_LOG::signal_update()
   signal_cnt++;
   mysql_cond_broadcast(&update_cond);
   DBUG_VOID_RETURN;
-}
-
-/*
- * Caller must hold LOCK_log mutex when the file is in use.
- */
-void MYSQL_BIN_LOG::update_binlog_end_pos()
-{
-  /*
-    binlog_end_pos is used only on master's binlog right now. It is possible
-    to use it on relay log.
-  */
-  if (is_relay_log)
-    signal_update();
-  else
-  {
-    lock_binlog_end_pos();
-    binlog_end_pos = my_b_tell(&log_file);
-    signal_update();
-    unlock_binlog_end_pos();
-  }
 }
 
 /****** transaction coordinator log for 2pc - binlog() based solution ******/
@@ -6711,7 +6651,7 @@ MYSQL_BIN_LOG::process_commit_stage_queue(THD *thd, THD *first)
         /*
           storage engine commit
         */
-        if (ha_commit_low(head, all))
+        if (ha_commit_low(head, all, false))
           head->commit_error= THD::CE_COMMIT_ERROR;
       }
       DBUG_PRINT("debug", ("commit_error: %d, flags.pending: %s",
@@ -6730,40 +6670,37 @@ MYSQL_BIN_LOG::process_commit_stage_queue(THD *thd, THD *first)
 }
 
 /**
-  Scans the semisync queue and calls before_commit hook
-  using the last thread in the queue.
+  Process after commit for a sequence of sessions.
 
-  @param queue_head  Head of the semisync stage queue.
+  @param thd The "master" thread
+  @param first First thread in the queue of threads to commit
+ */
 
-  Note that this should be used only for semisync wait.
-*/
 void
-MYSQL_BIN_LOG::process_semisync_stage_queue(THD *queue_head)
+MYSQL_BIN_LOG::process_after_commit_stage_queue(THD *thd, THD *first)
 {
-   THD *last_thd = NULL;
-   for (THD *thd = queue_head; thd != NULL; thd = thd->next_to_commit)
-   {
-      // run_hooks is set to true in ordered_commit() if storage
-      // engine commit is required.
-      if (thd->transaction.flags.run_hooks &&
-          thd->commit_error == THD::CE_NONE)
-      {
-        last_thd = thd;
-        // setting run_hooks to false allows other parts of the system to
-        // check if before commit hook is called for this thread.
-        // Also this avoids assertion in finish_commit.
-        thd->transaction.flags.run_hooks = false;
-      }
-   }
+  Thread_excursion excursion(thd);
+  for (THD *head= first; head; head= head->next_to_commit)
+  {
+    if (head->transaction.flags.run_hooks &&
+        head->commit_error == THD::CE_NONE)
+    {
 
-   if (last_thd)
-   {
-     // Since flush ordered is maintained even in the semisync stage
-     // calling hook for the last valid thd is sufficient since it
-     // will have the maximum binlog position.
-     (void) RUN_HOOK(transaction, before_commit,
-                     (last_thd, last_thd->transaction.flags.real_commit));
-   }
+      /*
+        TODO: This hook here should probably move outside/below this
+              if and be the only after_commit invocation left in the
+              code.
+      */
+      excursion.try_to_attach_to(head);
+      bool all= head->transaction.flags.real_commit;
+      (void) RUN_HOOK(transaction, after_commit, (head, all));
+      /*
+        When after_commit finished for the transaction, clear the run_hooks flag.
+        This allow other parts of the system to check if after_commit was called.
+      */
+      head->transaction.flags.run_hooks= false;
+    }
+  }
 }
 
 #ifndef DBUG_OFF
@@ -6771,7 +6708,6 @@ MYSQL_BIN_LOG::process_semisync_stage_queue(THD *queue_head)
 static const char* g_stage_name[] = {
   "FLUSH",
   "SYNC",
-  "SEMISYNC",
   "COMMIT",
 };
 #endif
@@ -6794,11 +6730,10 @@ static const char* g_stage_name[] = {
   The function will lock the stage mutex if it was designated the
   leader for the phase.
 
-  @param thd                Session structure
-  @param stage              The stage to enter
-  @param queue              Queue of threads to enqueue for the stage
-  @param leave_mutex        Mutex which will be released
-  @param enter_mutex        Mutex which will be acquired
+  @param thd    Session structure
+  @param stage  The stage to enter
+  @param queue  Queue of threads to enqueue for the stage
+  @param stage_mutex Mutex for the stage
 
   @retval true  The thread should "bail out" and go waiting for the
                 commit to finish
@@ -6900,35 +6835,36 @@ MYSQL_BIN_LOG::finish_commit(THD *thd)
       storage engine commit
     */
     if (thd->commit_error == THD::CE_NONE &&
-        ha_commit_low(thd, all))
+        ha_commit_low(thd, all, false))
       thd->commit_error= THD::CE_COMMIT_ERROR;
     /*
       Decrement the prepared XID counter after storage engine commit
     */
     if (thd->transaction.flags.xid_written)
       dec_prep_xids(thd);
+    /*
+      If commit succeeded, we call the after_commit hook
+
+      TODO: This hook here should probably move outside/below this
+            if and be the only after_commit invocation left in the
+            code.
+    */
+    if ((thd->commit_error == THD::CE_NONE) && thd->transaction.flags.run_hooks)
+    {
+      (void) RUN_HOOK(transaction, after_commit, (thd, all));
+      thd->transaction.flags.run_hooks= false;
+    }
   }
   else if (thd->transaction.flags.xid_written)
     dec_prep_xids(thd);
 
-  if (!thd->gtid_precommit)
-  {
-    /*
-     Remove committed GTID from owned_gtids, it was already logged on
-     MYSQL_BIN_LOG::write_cache().
-    */
-    global_sid_lock->rdlock();
-    gtid_state->update_on_commit(thd);
-    global_sid_lock->unlock();
-  }
-  else
-  {
-    /* Reset gtid_precommit. */
-    thd->gtid_precommit= false;
-    /* Clear gtid owned by current THD. */
-    thd->clear_owned_gtids();
-    thd->variables.gtid_next.set_undefined();
-  }
+  /*
+    Remove committed GTID from owned_gtids, it was already logged on
+    MYSQL_BIN_LOG::write_cache().
+  */
+  global_sid_lock->rdlock();
+  gtid_state->update_on_commit(thd);
+  global_sid_lock->unlock();
 
   DBUG_ASSERT(thd->commit_error || !thd->transaction.flags.run_hooks);
   DBUG_ASSERT(!thd_get_cache_mngr(thd)->dbug_any_finalized());
@@ -7015,8 +6951,6 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit)
   thd->transaction.flags.xid_written= false;
   thd->transaction.flags.commit_low= !skip_commit;
   thd->transaction.flags.run_hooks= !skip_commit;
-  thd->gtid_precommit= (opt_gtid_precommit &&
-              (thd->variables.gtid_next.type == AUTOMATIC_GROUP));
 #ifndef DBUG_OFF
   /*
      The group commit Leader may have to wait for follower whose transaction
@@ -7072,14 +7006,7 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit)
       flush_error= ER_ERROR_ON_WRITE;
     }
 
-    /*
-      Update the last valid position after the after_flush hook has
-      executed. Doing so guarantees that the hook is executed before
-      the before/after_send_hooks on the dump thread, preventing race
-      conditions between the group_commit here and the dump threads.
-    */
-    update_binlog_end_pos();
-
+    signal_update();
     DBUG_EXECUTE_IF("crash_commit_after_log", DBUG_SUICIDE(););
   }
 
@@ -7110,17 +7037,6 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit)
   if (need_LOCK_log)
     mysql_mutex_unlock(&LOCK_log);
 
-  if (change_stage(thd, Stage_manager::SEMISYNC_STAGE, final_queue,
-                   &LOCK_sync, &LOCK_semisync))
-  {
-    DBUG_PRINT("return", ("Thread ID: %lu, commit_error: %d",
-                          thd->thread_id, thd->commit_error));
-    DBUG_RETURN(finish_commit(thd));
-  }
-  THD *semisync_queue =
-    stage_manager.fetch_queue_for(Stage_manager::SEMISYNC_STAGE);
-  process_semisync_stage_queue(semisync_queue);
-
   /*
     Stage #3: Commit all transactions in order.
 
@@ -7133,19 +7049,26 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit)
   if (opt_binlog_order_commits)
   {
     if (change_stage(thd, Stage_manager::COMMIT_STAGE,
-                     semisync_queue, &LOCK_semisync, &LOCK_commit))
+                     final_queue, &LOCK_sync, &LOCK_commit))
     {
       DBUG_PRINT("return", ("Thread ID: %lu, commit_error: %d",
                             thd->thread_id, thd->commit_error));
       DBUG_RETURN(finish_commit(thd));
     }
     THD *commit_queue= stage_manager.fetch_queue_for(Stage_manager::COMMIT_STAGE);
+    DBUG_EXECUTE_IF("semi_sync_3-way_deadlock",
+                    DEBUG_SYNC(thd, "before_process_commit_stage_queue"););
     process_commit_stage_queue(thd, commit_queue);
     mysql_mutex_unlock(&LOCK_commit);
+    /*
+      Process after_commit after LOCK_commit is released for avoiding
+      3-way deadlock among user thread, rotate thread and dump thread.
+    */
+    process_after_commit_stage_queue(thd, commit_queue);
     final_queue= commit_queue;
   }
   else
-    mysql_mutex_unlock(&LOCK_semisync);
+    mysql_mutex_unlock(&LOCK_sync);
 
   /* Commit done so signal all waiting threads */
   stage_manager.signal_done(final_queue);
