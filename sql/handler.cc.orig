@@ -1,4 +1,4 @@
-/* Copyright (c) 2000, 2015, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2014, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -417,6 +417,7 @@ handlerton *ha_checktype(THD *thd, enum legacy_db_type database_type,
     return NULL;
   }
 
+  (void) RUN_HOOK(transaction, after_rollback, (thd, FALSE));
 
   switch (database_type) {
   case DB_TYPE_MRG_ISAM:
@@ -856,26 +857,6 @@ void ha_close_connection(THD* thd)
 {
   plugin_foreach(thd, closecon_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN, 0);
 }
-
-
-static my_bool kill_handlerton(THD *thd, plugin_ref plugin, void *)
-{
-  handlerton *hton= plugin_data(plugin, handlerton *);
-
-  if (hton->state == SHOW_OPTION_YES && hton->kill_connection)
-  {
-    if (thd_get_ha_data(thd, hton))
-      hton->kill_connection(hton, thd);
-  }
-
-  return FALSE;
-}
-
-void ha_kill_connection(THD *thd)
-{
-  plugin_foreach(thd, kill_handlerton, MYSQL_STORAGE_ENGINE_PLUGIN, 0);
-}
-
 
 /* ========================================================================
  ======================= TRANSACTIONS ===================================*/
@@ -1506,9 +1487,12 @@ end:
                    issued by DDL. Is not set when called
                    at the end of statement, even if
                    autocommit=1.
+  @param[in]  run_after_commit
+                   True by default, otherwise, does not execute
+                   the after_commit hook in the function.
 */
 
-int ha_commit_low(THD *thd, bool all)
+int ha_commit_low(THD *thd, bool all, bool run_after_commit)
 {
   int error=0;
   THD_TRANS *trans=all ? &thd->transaction.all : &thd->transaction.stmt;
@@ -1550,6 +1534,19 @@ int ha_commit_low(THD *thd, bool all)
     was called.
   */
   thd->transaction.flags.commit_low= false;
+  if (run_after_commit && thd->transaction.flags.run_hooks)
+  {
+    /*
+       If commit succeeded, we call the after_commit hook.
+
+       TODO: Investigate if this can be refactored so that there is
+             only one invocation of this hook in the code (in
+             MYSQL_LOG_BIN::finish_commit).
+    */
+    if (!error)
+      (void) RUN_HOOK(transaction, after_commit, (thd, all));
+    thd->transaction.flags.run_hooks= false;
+  }
   DBUG_RETURN(error);
 }
 
@@ -1592,6 +1589,7 @@ int ha_rollback_low(THD *thd, bool all)
       thd->transaction.xid_state.xa_state != XA_NOTR)
     thd->transaction.xid_state.rm_error= thd->get_stmt_da()->sql_errno();
 
+  (void) RUN_HOOK(transaction, after_rollback, (thd, all));
   return error;
 }
 
@@ -2232,44 +2230,25 @@ static my_bool flush_handlerton(THD *thd, plugin_ref plugin,
                                 void *arg)
 {
   handlerton *hton= plugin_data(plugin, handlerton *);
-  ulonglong target_lsn= 0;
-
-  if (arg)
-  {
-    /*
-      If arg is not NULL, this means we have specified engine
-      types to do log flushing.
-    */
-    engine_lsn_map* engine_map= (engine_lsn_map *)arg;
-
-    /* Shoudn't be empty.*/
-    DBUG_ASSERT(!engine_map->is_empty());
-
-    target_lsn= engine_map->get_lsn_by_type(hton->db_type);
-
-    if (target_lsn == 0)
-      return FALSE;
-  }
-
-  if (hton->state == SHOW_OPTION_YES && hton->flush_logs &&
-      hton->flush_logs(hton, target_lsn))
+  if (hton->state == SHOW_OPTION_YES && hton->flush_logs && 
+      hton->flush_logs(hton))
     return TRUE;
   return FALSE;
 }
 
 
-bool ha_flush_logs(handlerton *db_type, engine_lsn_map *engine_map)
+bool ha_flush_logs(handlerton *db_type)
 {
   if (db_type == NULL)
   {
     if (plugin_foreach(NULL, flush_handlerton,
-                          MYSQL_STORAGE_ENGINE_PLUGIN, (void *)(engine_map)))
+                          MYSQL_STORAGE_ENGINE_PLUGIN, 0))
       return TRUE;
   }
   else
   {
     if (db_type->state != SHOW_OPTION_YES ||
-        (db_type->flush_logs && db_type->flush_logs(db_type, 0)))
+        (db_type->flush_logs && db_type->flush_logs(db_type)))
       return TRUE;
   }
   return FALSE;
@@ -6307,7 +6286,7 @@ end:
 ha_rows DsMrr_impl::dsmrr_info(uint keyno, uint n_ranges, uint rows,
                                uint *bufsz, uint *flags, Cost_estimate *cost)
 {  
-  ha_rows res __attribute__((unused));
+  ha_rows DBUG_ONLY res;
   uint def_flags= *flags;
   uint def_bufsz= *bufsz;
 
